@@ -19,7 +19,7 @@ xray-manager —— xray-core 订阅管理器
   └── .state.json          ← 状态：订阅地址、排名列表、当前索引
 """
  
-import sys, os, json, base64, re, time, shutil, socket
+import sys, os, json, base64, re, time, shutil, socket, platform
 import urllib.parse, urllib.request, subprocess, threading
 from copy import deepcopy
 from datetime import datetime
@@ -86,6 +86,9 @@ DIRECT_PROC = DNS_PROC + ["xray","xray/","self/"]
 #  xray 配置生成
 # ─────────────────────────────────────────────────────────────────────────────
  
+def tun_name():
+    return "utun0" if platform.system()=="Darwin" else "tun0"
+
 def build_config(outbound: dict, server_host: str) -> dict:
     return {
         "log": {"loglevel": "warning"},
@@ -113,7 +116,7 @@ def build_config(outbound: dict, server_host: str) -> dict:
              "settings":{"auth":"noauth","udp":True,"allowTransparent":False}},
             {"tag":"tun","protocol":"tun",
              "sniffing":{"enabled":True,"destOverride":["http","tls"],"routeOnly":False},
-             "settings":{"name":"utun0","MTU":9000,"gateway":["172.18.0.1/30"],
+             "settings":{"name":tun_name(),"MTU":9000,"gateway":["172.18.0.1/30"],
                          "autoSystemRoutingTable":["0.0.0.0/0","::/0"],
                          "autoOutboundsInterface":"auto"}},
         ],
