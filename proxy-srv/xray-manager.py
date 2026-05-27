@@ -19,7 +19,7 @@ xray-manager —— xray-core 订阅管理器
   └── .state.json          ← 状态：订阅地址、排名列表、当前索引
 """
  
-import sys, os, json, base64, re, time, shutil, socket, platform
+import sys, os, json, base64, re, time, shutil, socket
 import urllib.parse, urllib.request, subprocess, threading
 from copy import deepcopy
 from datetime import datetime
@@ -86,10 +86,7 @@ DIRECT_PROC = DNS_PROC + ["xray","xray/","self/"]
 #  xray 配置生成
 # ─────────────────────────────────────────────────────────────────────────────
  
-def tun_name():
-    return "utun0" if platform.system()=="Darwin" else "tun0"
-
-def build_config(outbound: dict, server_host: str) -> dict:
+def build_config(idx: int, outbound: dict, server_host: str) -> dict:
     return {
         "log": {"loglevel": "warning"},
         "dns": {
@@ -116,7 +113,7 @@ def build_config(outbound: dict, server_host: str) -> dict:
              "settings":{"auth":"noauth","udp":True,"allowTransparent":False}},
             {"tag":"tun","protocol":"tun",
              "sniffing":{"enabled":True,"destOverride":["http","tls"],"routeOnly":False},
-             "settings":{"name":tun_name(),"MTU":9000,"gateway":["172.18.0.1/30"],
+             "settings":{"name":f"tun{idx}","MTU":9000,"gateway":["172.18.0.1/30"],
                          "autoSystemRoutingTable":["0.0.0.0/0","::/0"],
                          "autoOutboundsInterface":"auto"}},
         ],
@@ -492,7 +489,7 @@ def cmd_update(sub_url: str | None):
             proto = "hysteria2" if ob["settings"].get("version",0) == 2 else "hysteria"
  
         fname = f"{idx:03d}_{safe_name(name)}.json"
-        cfg = build_config(ob, host)
+        cfg = build_config(idx, ob, host)
         with open(os.path.join(NODES_DIR, fname), "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
  
@@ -617,7 +614,14 @@ def cmd_list():
         active = " ◀ 当前" if i == cur else ""
         print(f"  {i+1:02d}  {n['proto']:<12} {ms_str:>8}  {n['name']}{active}")
  
- 
+
+def fetch_ip_info():
+    try:
+        with urllib.request.urlopen("http://ip-api.com/json", timeout=3) as r:
+            return json.loads(r.read().decode())
+    except:
+        return None
+
 def cmd_status():
     """显示当前节点及实时健康状态。"""
     state = load_state()
@@ -642,8 +646,16 @@ def cmd_status():
     print("[*] 实时健康检查中……", end=" ", flush=True)
     ok = health_check()
     print("✓ 正常" if ok else "✗ 故障")
- 
- 
+    # 出口 IP 信息
+    print("[*] 查询出口 IP（ip-api.com）……")
+
+    info = fetch_ip_info()
+
+    if not info:
+        print("✗ 查询失败")
+        return
+    print(info)
+    
 def cmd_install():
     """安装 systemd watchdog timer，每 60 秒自动执行一次 check。"""
     script_path = os.path.abspath(__file__)
