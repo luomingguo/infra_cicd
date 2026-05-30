@@ -1,0 +1,143 @@
+name: Deploy Infra
+
+on:
+  push:
+    branches: [main]
+    paths: ['config.yaml', '**/Makefile', 'common.mk', '**.sh', '**.py']
+  pull_request:
+    paths: ['config.yaml']          # PR 改 config.yaml 时触发 validate
+  workflow_dispatch:
+    inputs:
+      modules:
+        description: '指定模块（空=全量，如 "etcd prometheus"）'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. config.yaml 校验（PR 和 push 都跑）──────────────────────────────────
+  validate-config:
+    name: Validate config.yaml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PyYAML
+        run: pip install pyyaml -q
+
+      - name: Check config.yaml
+        run: python3 scripts/config-gen.py --check
+
+      - name: Preview config.mk diff
+        # 先生成一次，再改动后 diff，PR 时直接展示变更
+        run: |
+          python3 scripts/config-gen.py
+          git diff --exit-code config.mk || echo "config.mk 需要更新（已在下方展示 diff）"
+          python3 scripts/config-gen.py --diff || true
+
+  # ── 2. ShellCheck ──────────────────────────────────────────────────────────
+  lint:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          ignore_paths: 'proxy-srv/install-release.sh'
+
+  # ── 3. 部署（只在 push main 或手动触发时）──────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [validate-config, lint]
+    if: github.event_name != 'pull_request'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          source: '.'
+          target: '/opt/infra_cicd'
+          rm: false
+
+      - name: Generate config.mk on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            cd /opt/infra_cicd
+            pip3 install pyyaml --break-system-packages -q
+            # 注入 secrets 中的敏感配置（不入 git）
+            [ -n "${{ secrets.XRAY_SUB_URL }}" ] && \
+              python3 -c "
+            import yaml, sys
+            with open('config.yaml') as f: cfg = yaml.safe_load(f)
+            cfg['proxy']['xray']['sub_url'] = '${{ secrets.XRAY_SUB_URL }}'
+            cfg['grafana']['admin_password'] = '${{ secrets.GRAFANA_ADMIN_PASSWORD }}'
+            with open('config.yaml', 'w') as f: yaml.dump(cfg, f, allow_unicode=True)
+            " || true
+            python3 scripts/config-gen.py
+
+      - name: Run make install
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          command_timeout: 30m
+          script: |
+            cd /opt/infra_cicd
+            MODULES="${{ github.event.inputs.modules }}"
+            if [ -n "$MODULES" ]; then
+              sudo make install MODULES="$MODULES"
+            else
+              sudo make install
+            fi
+
+  # ── 4. 健康检查 ────────────────────────────────────────────────────────────
+  health-check:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make test
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            cd /opt/infra_cicd
+            MODULES="${{ github.event.inputs.modules }}"
+            if [ -n "$MODULES" ]; then
+              for mod in $MODULES; do sudo make -C $mod test; done
+            else
+              sudo make test
+            fi
+
+      - name: Dump status on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: cd /opt/infra_cicd && sudo make status

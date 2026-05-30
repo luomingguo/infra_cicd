@@ -1,0 +1,125 @@
+# =============================================================================
+# config.yaml — 唯一需要人工编辑的配置文件
+#
+# 修改后运行：make config-gen
+# =============================================================================
+
+# ── 部署模式 ──────────────────────────────────────────────────────────────────
+deploy:
+  # compose  → 单机，docker compose，适合资源有限阶段
+  # k8s      → 分布式，兼容 k8s / k3s / kind
+  mode: compose
+
+  # 模块部署顺序（两种模式共用）
+  order:
+    - proxy-srv     # 代理层（裸机安装，两种模式都需要）
+    - infra         # 中间件（compose 或 k8s，由 mode 决定）
+
+  # 网络环境：auto | restricted | open
+  network: auto
+
+  host_ip: "127.0.0.1"
+  domain:  "example.com"
+
+# ── 证书 ──────────────────────────────────────────────────────────────────────
+certs:
+  dir:       "./certs"
+  fullchain: "./certs/fullchain.pem"
+  privkey:   "./certs/privkey.pem"
+
+# ── 代理层（裸机，两种模式共用）──────────────────────────────────────────────
+proxy:
+  xray:
+    sub_url:     ""
+    socks_port:  10808
+    http_port:   10809
+  tor:
+    socks_port:  9050
+    control_port: 9051
+
+# ── 版本（两种模式共用的唯一版本来源）────────────────────────────────────────
+versions:
+  etcd:           "3.6.0"
+  prometheus:     "3.8.0"
+  node_exporter:  "1.8.2"
+  grafana:        "11.5.0"
+
+# ── 存储 ──────────────────────────────────────────────────────────────────────
+storage:
+  # compose 模式：宿主机挂载路径
+  host:
+    etcd:       "/var/lib/etcd"
+    prometheus: "/var/lib/prometheus"
+    grafana:    "/var/lib/grafana"
+
+  # k8s 模式：PVC 配置
+  k8s:
+    storage_class: ""      # 空=使用集群默认 StorageClass
+    etcd_size:      "8Gi"
+    prometheus_size: "20Gi"
+    grafana_size:   "2Gi"
+
+# ── etcd ──────────────────────────────────────────────────────────────────────
+etcd:
+  client_port: 2379
+  peer_port:   2380
+  retention:   "1h"
+
+  # 单机模式：1个节点即可
+  # 分布式模式：追加节点，无需修改 Makefile
+  nodes:
+    - name: "etcd-0"
+      ip:   "127.0.0.1"
+  # 分布式示例（切换后取消注释）：
+  # nodes:
+  #   - { name: etcd-0, ip: 10.0.0.1 }
+  #   - { name: etcd-1, ip: 10.0.0.2 }
+  #   - { name: etcd-2, ip: 10.0.0.3 }
+
+# ── Prometheus ────────────────────────────────────────────────────────────────
+prometheus:
+  port:            9090
+  retention_time:  "30d"
+  retention_size:  "10GB"
+  scrape_interval: "15s"
+
+# ── Grafana ───────────────────────────────────────────────────────────────────
+grafana:
+  port:           3000
+  admin_password: "changeme"   # 生产请改，或走 secrets
+  tls:            false
+
+# ── compose 专属配置 ──────────────────────────────────────────────────────────
+compose:
+  project_name: "infra"
+  network_name: "infra-net"
+  restart:       "unless-stopped"
+
+# ── k8s 专属配置 ──────────────────────────────────────────────────────────────
+k8s:
+  namespace:      "infra"
+  # k3s / kind / 标准 k8s 均兼容，区别仅在安装命令
+  # flavor: k3s | kind | vanilla
+  flavor:         "k3s"
+  # 镜像拉取策略（受限区域考虑 IfNotPresent）
+  image_pull_policy: "IfNotPresent"
+  # 资源限制（单机 k3s 按需调小）
+  resources:
+    etcd:
+      requests: { cpu: "100m", memory: "256Mi" }
+      limits:   { cpu: "1",    memory: "1Gi"   }
+    prometheus:
+      requests: { cpu: "100m", memory: "256Mi" }
+      limits:   { cpu: "2",    memory: "2Gi"   }
+    grafana:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "500m", memory: "512Mi" }
+
+# ── 防火墙 ────────────────────────────────────────────────────────────────────
+firewall:
+  allow_ports:
+    - { port: 22,   proto: tcp, comment: "SSH" }
+    - { port: 2379, proto: tcp, comment: "etcd client",   internal_only: true }
+    - { port: 3000, proto: tcp, comment: "Grafana" }
+    - { port: 9090, proto: tcp, comment: "Prometheus" }
+    - { port: 9100, proto: tcp, comment: "node_exporter", internal_only: true }
