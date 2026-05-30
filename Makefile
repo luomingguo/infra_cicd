@@ -1,8 +1,8 @@
 # =============================================================================
-# 根 Makefile
-# deploy.mode=compose → docker/compose/Makefile
-# deploy.mode=k8s     → k8s/Makefile
-# proxy-srv 两种模式都需要（裸机安装）
+# 根 Makefile — 纯编排层
+#
+# 不知道有哪些模块，不知道模块内部有哪些变量。
+# 模块列表、顺序、mode 过滤全部来自 config.mk（由 config.yaml 生成）。
 # =============================================================================
 
 SHELL         := /bin/bash
@@ -20,7 +20,7 @@ else
   include $(CONFIG_MK)
 endif
 
-# ── 网络环境检测 ──────────────────────────────────────────────────────────────
+# ── 网络环境检测（写入 runtime.mk，子模块 include 获取）──────────────────────
 ifeq ($(DEPLOY_NETWORK),auto)
   RESTRICTED_REGION := $(shell \
     curl --silent --max-time 6 --head https://www.google.com -o /dev/null 2>/dev/null \
@@ -31,29 +31,14 @@ else
   RESTRICTED_REGION := false
 endif
 
-export RESTRICTED_REGION
-export PROXY_HTTP   := $(if $(filter true,$(RESTRICTED_REGION)),$(PROXY_HTTP_ADDR),)
-export PROXY_SOCKS5 := $(if $(filter true,$(RESTRICTED_REGION)),$(PROXY_SOCKS5_ADDR),)
+export INFRA_CONFIG_MK  := $(CURDIR)/config.mk
+export INFRA_RUNTIME_MK := $(CURDIR)/runtime.mk
+export INFRA_COMMON_MK  := $(CURDIR)/common.mk
 
-# 导出所有配置变量给子模块
-export DEPLOY_MODE DEPLOY_HOST_IP DEPLOY_DOMAIN
-export ETCD_VERSION ETCD_CLIENT_PORT ETCD_PEER_PORT ETCD_DATA_DIR
-export ETCD_NODE_NAME ETCD_NODE_IP ETCD_NODE_COUNT ETCD_INITIAL_CLUSTER ETCD_RETENTION
-export PROMETHEUS_VERSION PROMETHEUS_PORT PROMETHEUS_DATA_DIR
-export PROMETHEUS_RETENTION PROMETHEUS_RET_SIZE PROMETHEUS_SCRAPE_INT
-export GRAFANA_VERSION GRAFANA_PORT GRAFANA_DOMAIN GRAFANA_TLS GRAFANA_DATA_DIR
-export XRAY_SOCKS_PORT XRAY_HTTP_PORT TOR_SOCKS_PORT
-export CERTS_DIR CERTS_FULLCHAIN CERTS_PRIVKEY
-export COMPOSE_PROJECT COMPOSE_NETWORK COMPOSE_RESTART
-export K8S_NAMESPACE K8S_FLAVOR K8S_STORAGE_CLASS
-export K8S_ETCD_PVC_SIZE K8S_PROM_PVC_SIZE K8S_GRAFANA_PVC_SIZE K8S_IMAGE_PULL_POLICY
+$(shell python3 -c "r='$(RESTRICTED_REGION)';h='$(if $(filter true,$(RESTRICTED_REGION)),$(PROXY_HTTP_ADDR),)';s='$(if $(filter true,$(RESTRICTED_REGION)),$(PROXY_SOCKS5_ADDR),)';open('runtime.mk','w').write('# 自动生成，勿手动编辑\nRESTRICTED_REGION := '+r+'\nPROXY_HTTP        := '+h+'\nPROXY_SOCKS5      := '+s+'\n')")
 
-# ── 颜色 ──────────────────────────────────────────────────────────────────────
-BOLD  := \033[1m
-CYAN  := \033[0;36m
-GREEN := \033[0;32m
-RED   := \033[0;31m
-RESET := \033[0m
+# 颜色 / 工具函数来自 common.mk（颜色只在这里定义一次）
+include common.mk
 
 # ── 配置管理 ──────────────────────────────────────────────────────────────────
 
@@ -63,106 +48,92 @@ config-gen:                       ## 从 config.yaml 生成 config.mk + compose/
 	@echo -e "$(GREEN)提示: 运行 make config-show 查看当前配置$(RESET)"
 
 .PHONY: config-check
-config-check:                     ## 校验 config.yaml
+config-check:                     ## 校验 config.yaml（端口冲突、必填项、模块格式）
 	@python3 scripts/config-gen.py --check
 
 .PHONY: config-diff
-config-diff:                      ## 预览 config.yaml 变更的 diff
+config-diff:                      ## 预览 config.yaml 变更会产生哪些 config.mk 差异
 	@python3 scripts/config-gen.py --diff
 
 .PHONY: config-show
-config-show:                      ## 打印当前所有配置
+config-show:                      ## 打印当前生效的模块列表和关键配置
 	@echo -e "$(BOLD)部署模式  :$(RESET) $(DEPLOY_MODE)"
 	@echo -e "$(BOLD)网络环境  :$(RESET) $(DEPLOY_NETWORK) → RESTRICTED_REGION=$(RESTRICTED_REGION)"
-	@echo -e "$(BOLD)etcd      :$(RESET) v$(ETCD_VERSION)  :$(ETCD_CLIENT_PORT)  节点数=$(ETCD_NODE_COUNT)"
-	@echo -e "$(BOLD)Prometheus:$(RESET) v$(PROMETHEUS_VERSION)  :$(PROMETHEUS_PORT)"
-	@echo -e "$(BOLD)Grafana   :$(RESET) v$(GRAFANA_VERSION)  :$(GRAFANA_PORT)"
-ifeq ($(DEPLOY_MODE),k8s)
-	@echo -e "$(BOLD)k8s flavor:$(RESET) $(K8S_FLAVOR)  namespace=$(K8S_NAMESPACE)"
-endif
+	@echo -e "$(BOLD)模块列表  :$(RESET)"
+	@for mod in $(DEPLOY_MODULES); do echo "  $$mod"; done
 
-# ── 部署入口（按 mode 分叉）──────────────────────────────────────────────────
+# ── 部署（纯循环，不感知任何具体模块）───────────────────────────────────────
 
 .PHONY: install
-install: _require-config _check-root _install-proxy   ## 部署（自动按 deploy.mode 路由）
-ifeq ($(DEPLOY_MODE),compose)
-	@echo -e "$(CYAN)$(BOLD)── 模式: compose ──$(RESET)"
-	@$(MAKE) -C docker/compose install
-else ifeq ($(DEPLOY_MODE),k8s)
-	@echo -e "$(CYAN)$(BOLD)── 模式: k8s ($(K8S_FLAVOR)) ──$(RESET)"
-	@$(MAKE) -C k8s install
-else
-	$(error 未知 DEPLOY_MODE: $(DEPLOY_MODE))
-endif
+install: _require-config          ## 按 config.yaml 顺序部署所有模块
+	@echo -e "$(CYAN)$(BOLD)infra_cicd deploy [mode=$(DEPLOY_MODE)]$(RESET)"
+	@for mod in $(DEPLOY_MODULES); do \
+		echo -e "\n$(CYAN)$(BOLD)── $$mod ──$(RESET)"; \
+		$(MAKE) -C $$mod install \
+			|| { echo -e "$(RED)[FAIL] $$mod$(RESET)"; exit 1; }; \
+		echo -e "$(GREEN)[DONE] $$mod$(RESET)"; \
+	done
 	@$(MAKE) --no-print-directory _summary
 
-# proxy-srv 两种模式都需要（裸机层）
-.PHONY: _install-proxy
-_install-proxy:
-	@$(MAKE) -C proxy-srv install
-
 .PHONY: uninstall
-uninstall: _require-config _check-root                ## 卸载
-ifeq ($(DEPLOY_MODE),compose)
-	@$(MAKE) -C docker/compose uninstall
-else
-	@$(MAKE) -C k8s uninstall
-endif
+uninstall: _require-config        ## 按逆序卸载所有模块
+	@for mod in $$(echo $(DEPLOY_MODULES) | tr ' ' '\n' | tac); do \
+		$(MAKE) -C $$mod uninstall 2>/dev/null || true; \
+	done
 
 .PHONY: status
-status: _require-config                               ## 查看所有服务状态
-	@echo -e "$(BOLD)── proxy-srv ──$(RESET)"
-	@$(MAKE) -C proxy-srv status 2>/dev/null || true
-	@echo
-ifeq ($(DEPLOY_MODE),compose)
-	@$(MAKE) -C docker/compose status
-else
-	@$(MAKE) -C k8s status
-endif
+status: _require-config           ## 查看所有模块运行状态
+	@for mod in $(DEPLOY_MODULES); do \
+		echo -e "$(BOLD)── $$mod ──$(RESET)"; \
+		$(MAKE) -C $$mod status 2>/dev/null || echo "  (无 status target)"; \
+		echo; \
+	done
 
 .PHONY: test
-test: _require-config                                 ## 全量健康检查
-	@echo -e "$(BOLD)健康检查 [$(DEPLOY_MODE)]$(RESET)"
-	@$(MAKE) -C proxy-srv test    && echo -e "  proxy-srv   $(GREEN)PASS$(RESET)" || echo -e "  proxy-srv   $(RED)FAIL$(RESET)"
-ifeq ($(DEPLOY_MODE),compose)
-	@$(MAKE) -C docker/compose test
-else
-	@$(MAKE) -C k8s test
-endif
+test: _require-config             ## 全量健康检查
+	@echo -e "$(BOLD)健康检查$(RESET)"
+	@failed=""; \
+	for mod in $(DEPLOY_MODULES); do \
+		printf "  %-24s" "$$mod"; \
+		if $(MAKE) -C $$mod test -s 2>/dev/null; then \
+			echo -e "$(GREEN)PASS$(RESET)"; \
+		else \
+			echo -e "$(RED)FAIL$(RESET)"; \
+			failed="$$failed $$mod"; \
+		fi; \
+	done; \
+	[ -z "$$failed" ] \
+		&& echo -e "\n$(GREEN)$(BOLD)全部通过$(RESET)" \
+		|| { echo -e "\n$(RED)失败: $$failed$(RESET)"; exit 1; }
 
 .PHONY: logs
-logs: _require-config                                 ## 查看服务日志
-ifeq ($(DEPLOY_MODE),compose)
-	@$(MAKE) -C docker/compose logs
-else
-	@$(MAKE) -C k8s logs
-endif
+logs: _require-config             ## 查看所有模块日志（支持 logs 的模块）
+	@for mod in $(DEPLOY_MODULES); do \
+		$(MAKE) -C $$mod logs 2>/dev/null || true; \
+	done
 
-# ── 迁移辅助 ─────────────────────────────────────────────────────────────────
+# ── 迁移 / 备份 ───────────────────────────────────────────────────────────────
 
 .PHONY: migrate-compose-to-k8s
-migrate-compose-to-k8s: _require-config               ## 辅助：compose → k8s 迁移检查
+migrate-compose-to-k8s:           ## compose → k8s 迁移检查清单
 	@echo -e "$(BOLD)迁移前检查清单：$(RESET)"
-	@echo "  1. 已安装 k3s/k8s？            $(shell command -v kubectl &>/dev/null && echo ✓ || echo ✗ 未安装)"
-	@echo "  2. 已安装 StorageClass？        $(shell kubectl get sc 2>/dev/null | grep -c default || echo '无法检测')"
-	@echo "  3. config.yaml mode=k8s？       $(shell grep 'mode:' config.yaml | grep -q k8s && echo ✓ || echo ✗ 当前是 compose)"
-	@echo "  4. 数据备份完成？               请手动确认"
+	@echo "  kubectl 可用？  $(shell command -v kubectl &>/dev/null && echo ✓ || echo ✗)"
+	@echo "  当前 mode？     $(DEPLOY_MODE)"
 	@echo
 	@echo "迁移步骤："
-	@echo "  1. 备份数据: make backup"
+	@echo "  1. make backup"
 	@echo "  2. 修改 config.yaml: deploy.mode: k8s"
-	@echo "  3. make config-gen"
-	@echo "  4. make install"
+	@echo "  3. make config-gen && make install"
 
 .PHONY: backup
-backup:                                               ## 备份所有服务数据
-	@echo -e "$(BOLD)备份数据...$(RESET)"
+backup:                           ## 调用每个模块的 backup target（有则执行）
 	@BACKUP_DIR="/tmp/infra-backup-$$(date +%Y%m%d-%H%M%S)"; \
 	mkdir -p "$$BACKUP_DIR"; \
-	cp -r $(ETCD_DATA_DIR) "$$BACKUP_DIR/etcd" 2>/dev/null && echo "  ✓ etcd" || echo "  - etcd (跳过)"; \
-	cp -r $(PROMETHEUS_DATA_DIR) "$$BACKUP_DIR/prometheus" 2>/dev/null && echo "  ✓ prometheus" || echo "  - prometheus (跳过)"; \
-	cp -r $(GRAFANA_DATA_DIR) "$$BACKUP_DIR/grafana" 2>/dev/null && echo "  ✓ grafana" || echo "  - grafana (跳过)"; \
-	echo "  备份目录: $$BACKUP_DIR"
+	echo -e "$(BOLD)备份目录: $$BACKUP_DIR$(RESET)"; \
+	for mod in $(DEPLOY_MODULES); do \
+		$(MAKE) -C $$mod backup BACKUP_DIR="$$BACKUP_DIR" 2>/dev/null \
+			&& echo "  ✓ $$mod" || true; \
+	done
 
 # ── 内部 ──────────────────────────────────────────────────────────────────────
 
@@ -170,19 +141,28 @@ backup:                                               ## 备份所有服务数�
 _require-config:
 	@[ -f $(CONFIG_MK) ] || { echo -e "$(RED)请先运行 make config-gen$(RESET)"; exit 1; }
 
-.PHONY: _check-root
-_check-root:
-	@[ "$$(id -u)" -eq 0 ] || { echo -e "$(RED)请以 root 运行$(RESET)"; exit 1; }
-
 .PHONY: _summary
 _summary:
 	@echo
-	@echo -e "$(CYAN)$(BOLD)╔═══════════════════════════════════════════════╗$(RESET)"
-	@printf  "$(CYAN)$(BOLD)║$(RESET)  模式: %-38s$(CYAN)$(BOLD)║$(RESET)\n" "$(DEPLOY_MODE)"
-	@printf  "$(CYAN)$(BOLD)║$(RESET)  Prometheus  http://$(DEPLOY_HOST_IP):%-16s$(CYAN)$(BOLD)║$(RESET)\n" "$(PROMETHEUS_PORT)"
-	@printf  "$(CYAN)$(BOLD)║$(RESET)  Grafana     http://$(DEPLOY_HOST_IP):%-16s$(CYAN)$(BOLD)║$(RESET)\n" "$(GRAFANA_PORT)"
-	@printf  "$(CYAN)$(BOLD)║$(RESET)  etcd        $(DEPLOY_HOST_IP):%-22s$(CYAN)$(BOLD)║$(RESET)\n" "$(ETCD_CLIENT_PORT)"
-	@echo -e "$(CYAN)$(BOLD)╚═══════════════════════════════════════════════╝$(RESET)"
+	@echo -e "$(CYAN)$(BOLD)╔══════════════════════════════════════╗$(RESET)"
+	@printf  "$(CYAN)$(BOLD)║$(RESET)  mode=%-32s$(CYAN)$(BOLD)║$(RESET)\n" "$(DEPLOY_MODE)"
+	@echo -e "$(CYAN)$(BOLD)╠══════════════════════════════════════╣$(RESET)"
+	@for entry in $(DEPLOY_SUMMARIES); do \
+		mod=$$(echo $$entry | cut -d'|' -f1); \
+		url=$$(echo $$entry | cut -d'|' -f2); \
+		printf "$(CYAN)$(BOLD)║$(RESET)  %-14s %-22s$(CYAN)$(BOLD)║$(RESET)\n" "$$mod" "$$url"; \
+	done
+	@echo -e "$(CYAN)$(BOLD)╚══════════════════════════════════════╝$(RESET)"
+
+.PHONY: clean
+clean:                            ## 删除所有生成文件（config.mk / runtime.mk / compose / k8s manifests）
+	@for mod in $(DEPLOY_MODULES); do \
+		$(MAKE) -C $$mod clean 2>/dev/null || true; \
+	done
+	@rm -f config.mk runtime.mk
+	@rm -f docker/compose/docker-compose.yml
+	@rm -rf k8s/manifests/
+	@echo -e "$(GREEN)已清理所有生成文件$(RESET)"
 
 .PHONY: help
 help:
@@ -191,7 +171,7 @@ help:
 	@grep -E '^config-[a-z]+:.*##' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*##"};{printf "  $(CYAN)%-22s$(RESET) %s\n",$$1,$$2}'
 	@echo -e "\n$(BOLD)部署:$(RESET)"
-	@grep -E '^(install|uninstall|status|test|logs|migrate|backup):.*##' $(MAKEFILE_LIST) \
+	@grep -E '^(install|uninstall|status|test|logs|migrate|backup|clean):.*##' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*##"};{printf "  $(CYAN)%-22s$(RESET) %s\n",$$1,$$2}'
 	@echo
-	@echo -e "当前模式: $(BOLD)$(DEPLOY_MODE)$(RESET)"
+	@echo -e "当前模块: $(BOLD)$(DEPLOY_MODULES)$(RESET)"

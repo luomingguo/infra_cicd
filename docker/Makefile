@@ -1,14 +1,15 @@
 # =============================================================================
 # docker/Makefile
 # =============================================================================
-include ../common.mk
+include $(or $(INFRA_COMMON_MK), ../common.mk)
 
 MODULE_NAME := docker
 
 .DEFAULT_GOAL := install
 
 .PHONY: install
-install: _check-root              ## 安装 Docker Engine + compose-plugin
+install:                          ## 安装 Docker Engine + compose-plugin
+	$(call require_root)
 	@if command -v docker &>/dev/null; then \
 		echo -e "$(GREEN)[docker]$(RESET) 已安装: $$(docker --version)"; \
 	else \
@@ -22,7 +23,15 @@ endif
 _install-engine:
 ifeq ($(RESTRICTED_REGION),true)
 	$(call log_info,受限区域：通过代理安装 Docker...)
-	@bash install.sh
+	@$(CURL) https://get.docker.com | sh
+	@mkdir -p /etc/apt/keyrings
+	@curl -fsSL -x $(PROXY_HTTP) https://download.docker.com/linux/ubuntu/gpg \
+		| gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+	@echo "deb [arch=$$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+		https://download.docker.com/linux/ubuntu $$(lsb_release -cs) stable" \
+		| tee /etc/apt/sources.list.d/docker.list > /dev/null
+	@$(APT) update
+	@$(APT) install -y docker-compose-plugin
 else
 	$(call log_info,直接安装 Docker...)
 	@$(CURL) https://get.docker.com | sh
@@ -33,10 +42,17 @@ endif
 .PHONY: _configure-proxy
 _configure-proxy:
 	$(call log_info,配置 Docker daemon 代理...)
-	@bash docker_proxy.sh
+	@mkdir -p /etc/systemd/system/docker.service.d
+	@printf '[Service]\nEnvironment="HTTP_PROXY=$(PROXY_HTTP_ADDR)/"\nEnvironment="HTTPS_PROXY=$(PROXY_HTTP_ADDR)/"\nEnvironment="NO_PROXY=localhost,127.0.0.1,docker.internal"\n' \
+		> /etc/systemd/system/docker.service.d/http-proxy.conf
+	@systemctl daemon-reexec
+	@systemctl daemon-reload
+	@systemctl restart docker
+	$(call log_info,Docker proxy 配置完成)
 
 .PHONY: uninstall
-uninstall: _check-root            ## 卸载 Docker（不删除数据卷）
+uninstall:                        ## 卸载 Docker（不删除数据卷）
+	$(call require_root)
 	@apt-get remove -y docker-ce docker-ce-cli containerd.io \
 		docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
 	$(call log_info,Docker 已卸载（数据卷保留在 /var/lib/docker）)

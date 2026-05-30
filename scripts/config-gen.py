@@ -33,7 +33,7 @@ CONFIG_MK = REPO_ROOT / "config.mk"
 def validate(cfg: dict) -> list[str]:
     errors = []
     for section, key in [
-        ("deploy", "mode"), ("deploy", "order"),
+        ("deploy", "mode"), ("deploy", "modules"),
         ("versions", "etcd"), ("versions", "prometheus"), ("versions", "grafana"),
         ("etcd", "client_port"), ("prometheus", "port"), ("grafana", "port"),
     ]:
@@ -47,6 +47,14 @@ def validate(cfg: dict) -> list[str]:
     network = cfg.get("deploy", {}).get("network", "")
     if network not in {"auto", "restricted", "open"}:
         errors.append(f"deploy.network 必须是 auto/restricted/open，当前: {network!r}")
+
+    # 校验每个 module 条目格式
+    for i, entry in enumerate(cfg.get("deploy", {}).get("modules", [])):
+        if "module" not in entry:
+            errors.append(f"deploy.modules[{i}] 缺少 module 字段")
+        only_mode = entry.get("only_mode", "")
+        if only_mode and only_mode not in {"compose", "k8s"}:
+            errors.append(f"deploy.modules[{i}].only_mode 必须是 compose 或 k8s，当前: {only_mode!r}")
 
     # 端口冲突
     ports: dict[int, str] = {}
@@ -74,6 +82,32 @@ def validate(cfg: dict) -> list[str]:
 def build_initial_cluster(nodes, peer_port):
     return ",".join(f"{n['name']}=http://{n['ip']}:{peer_port}" for n in nodes)
 
+def resolve_modules(deploy: dict) -> tuple[list[str], list[str]]:
+    """
+    按当前 mode 过滤 deploy.modules，返回：
+      - active_modules:  实际要执行的目录名列表（空格分隔用于 DEPLOY_MODULES）
+      - summary_lines:   ["目录名|摘要URL", ...]（非空 summary 才加入）
+    """
+    mode    = deploy.get("mode", "compose")
+    entries = deploy.get("modules", [])
+
+    active   = []
+    summaries = []
+    for e in entries:
+        mod       = e.get("module", "")
+        only_mode = e.get("only_mode", "")
+        summary   = e.get("summary", "")
+
+        # only_mode 不为空时做过滤；为空则两种模式都执行
+        if only_mode and only_mode != mode:
+            continue
+
+        active.append(mod)
+        if summary:
+            summaries.append(f"{mod}|{summary}")
+
+    return active, summaries
+
 def generate_mk(cfg: dict) -> str:
     deploy   = cfg["deploy"]
     versions = cfg["versions"]
@@ -86,16 +120,23 @@ def generate_mk(cfg: dict) -> str:
     xray     = proxy.get("xray", {})
     tor      = proxy.get("tor", {})
 
+    active_modules, summary_lines = resolve_modules(deploy)
+
     lines = [
         "# 自动生成，请勿手动编辑。修改 config.yaml 后运行 make config-gen",
         f"# 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "# ── 部署模式 ────────────────────────────────────────────────",
         f"DEPLOY_MODE           := {deploy.get('mode','compose')}",
-        f"DEPLOY_MODULES        := {' '.join(deploy.get('order',[]))}",
         f"DEPLOY_NETWORK        := {deploy.get('network','auto')}",
         f"DEPLOY_HOST_IP        := {deploy.get('host_ip','127.0.0.1')}",
         f"DEPLOY_DOMAIN         := {deploy.get('domain','')}",
+        "",
+        "# 按 mode 过滤后的实际执行模块（顺序来自 config.yaml deploy.modules）",
+        f"DEPLOY_MODULES        := {' '.join(active_modules)}",
+        "",
+        "# 部署完成摘要（格式：模块名|URL，空格分隔多条）",
+        f"DEPLOY_SUMMARIES      := {' '.join(summary_lines) if summary_lines else '(none)'}",
         "",
         "# ── 证书 ────────────────────────────────────────────────────",
         f"CERTS_DIR             := {certs.get('dir','./certs')}",

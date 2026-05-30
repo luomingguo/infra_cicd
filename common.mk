@@ -1,9 +1,27 @@
 # =============================================================================
 # common.mk — 子模块共用工具层
-# 所有配置变量由根 Makefile 从 config.mk 导出，此处只定义工具函数
+# 颜色变量、日志宏、require_root、CURL、APT 的唯一定义处
+# 负责加载 config.mk 和 runtime.mk，子模块无需重复 include
 # =============================================================================
 
 SHELL := /bin/bash
+
+# ── 自动加载配置（子模块直接调用时生效，根 Makefile 已加载则跳过）──────────────
+ifndef DEPLOY_MODE
+  ifneq ($(wildcard $(INFRA_CONFIG_MK)),)
+    include $(INFRA_CONFIG_MK)
+  else ifneq ($(wildcard ../config.mk),)
+    include ../config.mk
+  endif
+  ifneq ($(wildcard $(INFRA_RUNTIME_MK)),)
+    include $(INFRA_RUNTIME_MK)
+  else ifneq ($(wildcard ../runtime.mk),)
+    include ../runtime.mk
+  endif
+endif
+
+# ── 脚本目录（从 config.mk 路径推导或回退到相对路径）────────────────────────
+SCRIPTS_DIR := $(if $(INFRA_CONFIG_MK),$(dir $(INFRA_CONFIG_MK))scripts,../scripts)
 
 # ── 颜色 ──────────────────────────────────────────────────────────────────────
 BOLD   := \033[1m
@@ -23,6 +41,8 @@ UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),x86_64)
   ARCH := amd64
 else ifeq ($(UNAME_M),aarch64)
+  ARCH := arm64
+else ifeq ($(UNAME_M),arm64)
   ARCH := arm64
 else
   $(error 不支持的架构: $(UNAME_M))
@@ -59,14 +79,12 @@ define wait_port
 	done; echo " 超时"; exit 1
 endef
 
-# ── 通用检查 ──────────────────────────────────────────────────────────────────
+# ── 权限检查（在 recipe 内联调用：$(call require_root)）────────────────────────
+define require_root
+@[ "$$(id -u)" -eq 0 ] || { echo -e "$(RED)需要 root 权限$(RESET)"; exit 1; }
+endef
+
+# 保留 _check-root 作为兼容别名
 .PHONY: _check-root
 _check-root:
-	@[ "$$(id -u)" -eq 0 ] || { echo -e "$(RED)需要 root 权限$(RESET)"; exit 1; }
-
-# 每个子模块独立运行时（不通过根 Makefile），加载 config.mk
-_maybe_load_config:
-	@[ -n "$(ETCD_VERSION)" ] || { \
-		echo -e "$(YELLOW)直接调用子模块，尝试加载 ../config.mk$(RESET)"; \
-		[ -f ../config.mk ] || { echo -e "$(RED)找不到 ../config.mk，请先运行 make config-gen$(RESET)"; exit 1; }; \
-	}
+	$(call require_root)
