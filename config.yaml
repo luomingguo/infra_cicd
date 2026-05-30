@@ -2,24 +2,52 @@
 # config.yaml — 唯一需要人工编辑的配置文件
 #
 # 修改后运行：make config-gen
+# 敏感值（XRAY_SUB_URL、GRAFANA_ADMIN_PASSWORD）通过环境变量或 CI Secrets 注入，
+# 不写在此文件中。
 # =============================================================================
 
 # ── 部署模式 ──────────────────────────────────────────────────────────────────
 deploy:
   # compose  → 单机，docker compose，适合资源有限阶段
-  # k8s      → 分布式，兼容 k8s / k3s / kind
+  # k8s      → 分布式，兼容 k3s / k8s / kind
   mode: compose
 
-  # 模块部署顺序（两种模式共用）
-  order:
-    - proxy-srv     # 代理层（裸机安装，两种模式都需要）
-    - infra         # 中间件（compose 或 k8s，由 mode 决定）
-
   # 网络环境：auto | restricted | open
+  # auto       自动检测（访问 google.com 超时则判定为受限）
+  # restricted 强制受限：xray-core + tor，xray HTTP 代理作为 tor 上游
+  # open       强制直连：仅 tor
   network: auto
 
   host_ip: "127.0.0.1"
   domain:  "example.com"
+
+  # ── 模块部署顺序 ────────────────────────────────────────────────────────────
+  # - module:    对应仓库内子目录（必须含 Makefile，实现 install/uninstall/status/test）
+  # - only_mode: compose | k8s | 留空表示两种模式都执行
+  # - summary:   部署完成后在摘要中展示的访问地址（可选）
+  #
+  # 新增模块：此处追加一项，根 Makefile 无需改动
+  modules:
+    - module: proxy-srv              # 代理层，两种模式共用，最先安装
+
+    - module: docker                 # Docker Engine 安装（compose 模式依赖）
+      only_mode: compose
+
+    - module: docker/compose         # compose 生命周期
+      only_mode: compose
+
+    - module: k8s                    # k8s/k3s/kind 生命周期
+      only_mode: k8s
+
+    - module: etcd
+      summary: ""
+
+    - module: prometheus
+      summary: "http://{{ host_ip }}:9090"
+
+    - module: grafana
+      summary: "http://{{ host_ip }}:3000"
+
 
 # ── 证书 ──────────────────────────────────────────────────────────────────────
 certs:
@@ -30,14 +58,13 @@ certs:
 # ── 代理层（裸机，两种模式共用）──────────────────────────────────────────────
 proxy:
   xray:
-    sub_url:     ""
-    socks_port:  10808
-    http_port:   10809
+    socks_port:  10808               # SOCKS5 出口，供本机其他服务使用
+    http_port:   10809               # HTTP CONNECT 出口，供 Docker/APT 使用
   tor:
     socks_port:  9050
     control_port: 9051
 
-# ── 版本（两种模式共用的唯一版本来源）────────────────────────────────────────
+# ── 版本 ──────────────────────────────────────────────────────────────────────
 versions:
   etcd:           "3.6.0"
   prometheus:     "3.8.0"
@@ -46,15 +73,13 @@ versions:
 
 # ── 存储 ──────────────────────────────────────────────────────────────────────
 storage:
-  # compose 模式：宿主机挂载路径
-  host:
+  host:                              # compose 模式：宿主机挂载路径
     etcd:       "/var/lib/etcd"
     prometheus: "/var/lib/prometheus"
     grafana:    "/var/lib/grafana"
 
-  # k8s 模式：PVC 配置
-  k8s:
-    storage_class: ""      # 空=使用集群默认 StorageClass
+  k8s:                               # k8s 模式：PVC 配置
+    storage_class: ""                # 空 = 使用集群默认 StorageClass
     etcd_size:      "8Gi"
     prometheus_size: "20Gi"
     grafana_size:   "2Gi"
@@ -65,12 +90,10 @@ etcd:
   peer_port:   2380
   retention:   "1h"
 
-  # 单机模式：1个节点即可
-  # 分布式模式：追加节点，无需修改 Makefile
   nodes:
     - name: "etcd-0"
       ip:   "127.0.0.1"
-  # 分布式示例（切换后取消注释）：
+  # 分布式示例（取消注释并修改 mode 为 k8s）：
   # nodes:
   #   - { name: etcd-0, ip: 10.0.0.1 }
   #   - { name: etcd-1, ip: 10.0.0.2 }
@@ -86,24 +109,21 @@ prometheus:
 # ── Grafana ───────────────────────────────────────────────────────────────────
 grafana:
   port:           3000
-  admin_password: "changeme"   # 生产请改，或走 secrets
+  admin_password: "changeme"         # 生产环境请通过 GRAFANA_ADMIN_PASSWORD 环境变量覆盖
   tls:            false
 
-# ── compose 专属配置 ──────────────────────────────────────────────────────────
+# ── compose 专属 ──────────────────────────────────────────────────────────────
 compose:
   project_name: "infra"
   network_name: "infra-net"
   restart:       "unless-stopped"
 
-# ── k8s 专属配置 ──────────────────────────────────────────────────────────────
+# ── k8s 专属 ──────────────────────────────────────────────────────────────────
 k8s:
-  namespace:      "infra"
-  # k3s / kind / 标准 k8s 均兼容，区别仅在安装命令
-  # flavor: k3s | kind | vanilla
-  flavor:         "k3s"
-  # 镜像拉取策略（受限区域考虑 IfNotPresent）
-  image_pull_policy: "IfNotPresent"
-  # 资源限制（单机 k3s 按需调小）
+  namespace: "infra"
+  flavor:    "k3s"                   # k3s | kind | vanilla
+  image_pull_policy: "IfNotPresent"  # 受限区域建议 IfNotPresent
+
   resources:
     etcd:
       requests: { cpu: "100m", memory: "256Mi" }
